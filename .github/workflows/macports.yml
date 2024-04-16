@@ -1,0 +1,180 @@
+name: macports
+
+on:
+  workflow_dispatch:
+
+env:
+  CC: clang
+  CXX: clang++
+  CPATH: /opt/local/include
+  LIBRARY_PATH: /opt/local/lib
+  CFLAGS: -O3 -Wno-deprecated-declarations
+  CROSSCFLAGS: -O3
+  LDFLAGS: -Wl,-rpath,/opt/local/lib
+  MACOSX_DEPLOYMENT_TARGET: 10.15
+  WINE_CONFIGURE: $GITHUB_WORKSPACE/sources/wine/configure
+  WINE_APPLOADER: $GITHUB_WORKSPACE/sources/wine/tools/wineapploader.in
+  BUILDROOT: $GITHUB_WORKSPACE/build
+  WINE_INSTALLROOT: wine
+  SHARED_LIB_EXPORT: shared_libs
+
+jobs:
+  wine-crossover:
+    strategy:
+      fail-fast: false
+      matrix:
+        CROSS_OVER_VERSION: [24.0.1]
+
+    runs-on: macos-latest
+
+    env:
+      CROSS_OVER_SOURCE_URL: https://media.codeweavers.com/pub/crossover/source/crossover-sources-${{ matrix.CROSS_OVER_VERSION }}.tar.gz
+      CROSS_OVER_LOCAL_FILE: crossover-sources-${{ matrix.CROSS_OVER_VERSION }}
+      WINE_INSTALLATION: wine-cx-${{ matrix.CROSS_OVER_VERSION }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bootstrap MacPorts
+        run: |
+          . .github/workflows/bootstrap.sh
+          git clone "https://github.com/Gcenx/macports-wine"
+          sudo mv /opt/local/etc/macports/sources.conf /opt/local/etc/macports/sources.conf.orig
+          echo "file://$GITHUB_WORKSPACE/macports-wine" | sudo tee /opt/local/etc/macports/sources.conf
+          cat /opt/local/etc/macports/sources.conf.orig | sudo tee -a /opt/local/etc/macports/sources.conf
+          sudo port -v sync
+          sudo echo "build_arch x86_64" | sudo tee -a /opt/local/etc/macports/macports.conf
+          sudo echo "universal_archs x86_64 i386" | sudo tee -a /opt/local/etc/macports/macports.conf
+          sudo echo "+universal" | sudo tee -a /opt/local/etc/macports/variants.conf
+          sudo echo "-docs -pulseaudio -jack -gtk3 -qt -x11 +quartz" | sudo tee -a /opt/local/etc/macports/variants.conf
+
+      - name: Adding MacPorts into $PATH
+        run: |
+          set -eu
+          echo "/opt/local/bin" >> $GITHUB_PATH
+          echo "/opt/local/sbin" >> $GITHUB_PATH
+
+      - name: Installing dependencies libraries
+        run: |
+          sudo port install \
+            freetype \
+            gettext-runtime \
+            gnutls \
+            moltenvk \
+            libsdl2 \
+            libpcap \
+            libinotify \
+            gstreamer1-gst-plugins-good \
+            gstreamer1-gst-libav
+
+      - name: Export shared libraries
+        run: |
+          sudo port reclaim
+          mkdir -p ${{ env.SHARED_LIB_EXPORT }}
+          pushd ${{ env.SHARED_LIB_EXPORT }}
+          find ${{ env.LIBRARY_PATH }}/ -name "*.dylib" -type f -exec cp -v -n "{}" ./ \; || true
+          find ${{ env.LIBRARY_PATH }}/ -name "*.so" -type f -exec cp -v -n "{}" ./ \; || true
+          find ${{ env.LIBRARY_PATH }}/../libexec/openssl3/ -name "*.dylib" -type f -exec cp -v -n "{}" ./ \; || true
+          bash $GITHUB_WORKSPACE/macports_fix_dylib.sh
+          find ${{ env.LIBRARY_PATH }}/ -name "*.dylib" -type l -exec cp -v -a -n "{}" ./ \; || true
+          find ${{ env.LIBRARY_PATH }}/ -name "*.so" -type l -exec cp -v -a -n "{}" ./ \; || true
+          popd
+      - name: Installing dependencies build
+        run: |
+          sudo port install \
+            bison \
+            gettext \
+            mingw-w64 \
+            pkgconfig
+
+      - name: Downloading Crossover Sources
+        run: |
+          curl -o ${{ env.CROSS_OVER_LOCAL_FILE }}.tar.gz ${{ env.CROSS_OVER_SOURCE_URL }}
+
+      - name: Extract Crossover Sources
+        run: |
+          tar xf ${{ env.CROSS_OVER_LOCAL_FILE }}.tar.gz
+
+      - name: Add distversion.h
+        run: |
+          cp distversion.h sources/wine/programs/winedbg/distversion.h
+
+      - name: Configure wine
+        run: |
+          mkdir -p ${{ env.BUILDROOT }}/wine
+          pushd ${{ env.BUILDROOT }}/wine
+          ${{ env.WINE_CONFIGURE }} \
+            --prefix= \
+            --enable-archs=i386,x86_64 \
+            --with-vulkan \
+            --without-alsa \
+            --without-capi \
+            --with-coreaudio \
+            --with-cups \
+            --without-dbus \
+            --without-fontconfig \
+            --with-freetype \
+            --with-gettext \
+            --without-gettextpo \
+            --without-gphoto \
+            --with-gnutls \
+            --without-gssapi \
+            --with-gstreamer \
+            --with-inotify \
+            --without-krb5 \
+            --with-mingw \
+            --without-netapi \
+            --with-opencl \
+            --with-opengl \
+            --without-oss \
+            --with-pcap \
+            --with-pcsclite \
+            --with-pthread \
+            --without-pulse \
+            --without-sane \
+            --with-sdl \
+            --without-udev \
+            --with-unwind \
+            --without-usb \
+            --without-v4l2 \
+            --without-wayland \
+            --without-x
+          popd
+
+      - name: Build wine
+        run: |
+          pushd ${{ env.BUILDROOT }}/wine
+          make -j$(sysctl -n hw.ncpu 2>/dev/null)
+          popd
+
+      - name: Install wine
+        run: |
+          pushd ${{ env.BUILDROOT }}/wine
+          make install-lib DESTDIR="$GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}"
+          popd
+          for winecommands in winepath winemine winefile winedbg wineconsole winecfg wineboot regsvr32 regedit notepad msiexec msidb; do
+            cp -v ${{ env.WINE_APPLOADER }} $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/$winecommands
+          done
+          install_name_tool -delete_rpath /opt/local/lib $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wine
+          install_name_tool -delete_rpath /opt/local/lib $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wineserver
+          install_name_tool -delete_rpath /opt/local/lib $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wine-preloader
+          cp $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wine $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wine64
+          cp $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wine-preloader $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wine64-preloader
+          find ${{ env.SHARED_LIB_EXPORT }}/ -type f -exec cp -v -a "{}" ${{ env.WINE_INSTALLROOT }}/lib/ \;
+          find ${{ env.SHARED_LIB_EXPORT }}/ -type l -exec cp -v -a "{}" ${{ env.WINE_INSTALLROOT }}/lib/ \;
+          install_name_tool -change /opt/local/lib/libinotify.0.dylib @loader_path/../lib/libinotify.0.dylib $GITHUB_WORKSPACE/${{ env.WINE_INSTALLROOT }}/bin/wineserver
+          pushd ${{ env.WINE_INSTALLROOT }}/lib/wine/x86_64-unix
+          bash $GITHUB_WORKSPACE/macports_fix_so.sh
+          popd
+
+      - name: Tar Wine
+        run: |
+          chmod -R u+rw,g+r,o+r ${{ env.WINE_INSTALLROOT }}
+          tar -czvf ${{ env.WINE_INSTALLATION }}.tar.gz ${{ env.WINE_INSTALLROOT }}
+
+      - name: Upload Wine
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.WINE_INSTALLATION }}
+          path: ${{ env.WINE_INSTALLATION }}.tar.gz
